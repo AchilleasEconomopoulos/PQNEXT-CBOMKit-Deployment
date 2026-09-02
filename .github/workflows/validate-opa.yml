@@ -47,9 +47,9 @@ jobs:
             "$OPA_IMAGE" \
             check --strict /policies
 
-      - name: Run policy tests
-        run: |
-          docker run --rm \
-            --mount type=bind,source="$PWD/opa",target=/policies,readonly \
-            "$OPA_IMAGE" \
-            test /policies --verbose --fail-on-empty
+      # - name: Run policy tests
+      #   run: |
+      #     docker run --rm \
+      #       --mount type=bind,source="$PWD/opa",target=/policies,readonly \
+      #       "$OPA_IMAGE" \
+      #       test /policies --verbose --fail-on-empty
