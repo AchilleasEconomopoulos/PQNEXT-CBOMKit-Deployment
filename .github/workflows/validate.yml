@@ -1,0 +1,42 @@
+name: Validate deployment
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install YAML linter
+        run: pipx install yamllint
+
+      - name: Lint YAML
+        run: >-
+          yamllint -d relaxed
+          docker-compose.yml
+          .github/workflows/validate.yml
+
+      - name: Validate Docker Compose
+        env:
+          SERVER_IP: 127.0.0.1
+          POSTGRESQL_AUTH_USERNAME: ci-user
+          POSTGRESQL_AUTH_PASSWORD: ci-password
+          CBOMKIT_VIEWER: "false"
+          PKI_DIR: ./pki
+        run: docker compose config --quiet
