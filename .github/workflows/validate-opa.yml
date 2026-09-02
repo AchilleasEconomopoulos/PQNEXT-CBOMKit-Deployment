@@ -1,0 +1,55 @@
+name: Validate OPA policies
+
+on:
+  pull_request:
+    paths:
+      - "opa/**"
+  push:
+    branches:
+      - main
+    paths:
+      - "opa/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-opa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OPA_IMAGE: docker.io/openpolicyagent/opa:1.15.1
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Check Rego formatting
+        shell: bash
+        run: |
+          while IFS= read -r -d '' policy; do
+            relative_path="${policy#opa/}"
+            docker run --rm \
+              --mount type=bind,source="$PWD/opa",target=/policies,readonly \
+              "$OPA_IMAGE" \
+              fmt --diff --fail "/policies/$relative_path"
+          done < <(find opa -type f -name '*.rego' -print0)
+
+      - name: Compile policies in strict mode
+        run: |
+          docker run --rm \
+            --mount type=bind,source="$PWD/opa",target=/policies,readonly \
+            "$OPA_IMAGE" \
+            check --strict /policies
+
+      - name: Run policy tests
+        run: |
+          docker run --rm \
+            --mount type=bind,source="$PWD/opa",target=/policies,readonly \
+            "$OPA_IMAGE" \
+            test /policies --verbose --fail-on-empty
