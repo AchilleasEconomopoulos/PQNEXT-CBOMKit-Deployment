@@ -30,7 +30,7 @@ x-pki-environment: &pki-environment
 
 services:
   backend:
-    image: pqnext-cbomkit-backend
+    image: ghcr.io/AchilleasEconomopoulos/pqnext-cbom-backend
     depends_on:
       db:
         condition: service_healthy
@@ -57,7 +57,7 @@ services:
           memory: 16g
 
   frontend:
-    image: pqnext-cbomkit-frontend
+    image: ghcr.io/AchilleasEconomopoulos/pqnext-cbom-frontend
     environment:
       VUE_APP_HTTP_API_BASE: "https://${SERVER_IP:?SERVER_IP must be set}/"
       VUE_APP_WS_API_BASE: "wss://${SERVER_IP:?SERVER_IP must be set}/"
