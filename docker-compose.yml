@@ -1,12 +1,12 @@
-# CBOMkit
+# PQNEXT-CBOMKit
 # Copyright (C) 2026 PQCA
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
-# contributor license agreements.  See the NOTICE file distributed with
+# contributor license agreements. See the NOTICE file distributed with
 # this work for additional information regarding copyright ownership.
 # The ASF licenses this file to you under the Apache License, Version 2.0
 # (the "License"); you may not use this file except in compliance with
-# the License.  You may obtain a copy of the License at
+# the License. You may obtain a copy of the License at
 #
 #      https://www.apache.org/licenses/LICENSE-2.0
 #
@@ -15,102 +15,101 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+x-pki-image: &pki-image
+  image: pqnext-cbomkit-step-ca:0.1.0
+  build:
+    context: .
+    dockerfile: step-ca/Dockerfile
+
+x-pki-environment: &pki-environment
+  SERVER_IP: ${SERVER_IP:?SERVER_IP must be set}
+  SERVER_DNS_NAME: ${SERVER_DNS_NAME:-}
+  STEP_CA_NAME: ${STEP_CA_NAME:-PQNEXT-CBOMKit CA}
+  STEP_CA_DNS_NAMES: ${STEP_CA_DNS_NAMES:-}
+
 services:
   backend:
-    image: cbomkit-backend
+    image: pqnext-cbomkit-backend
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+      opa:
+        condition: service_started
     environment:
       CBOMKIT_DB_TYPE: postgresql
       CBOMKIT_DB_JDBC_URL: jdbc:postgresql://db:5432/postgres
       CBOMKIT_PORT: 8081
-      CBOMKIT_DB_USERNAME: ${POSTGRESQL_AUTH_USERNAME}
-      CBOMKIT_DB_PASSWORD: ${POSTGRESQL_AUTH_PASSWORD}
+      CBOMKIT_DB_USERNAME: ${POSTGRESQL_AUTH_USERNAME:-cbomkit}
+      CBOMKIT_DB_PASSWORD: ${POSTGRESQL_AUTH_PASSWORD:-cbomkit}
       CBOMKIT_FRONTEND_URL_CORS: "https://${SERVER_IP:?SERVER_IP must be set}"
-      CBOMKIT_OPA_API_BASE: "http://opa:8181"
+      CBOMKIT_OPA_API_BASE: http://opa:8181
     expose:
       - "8081"
     volumes:
-      - cbomkit-volume:/home/user/.cbomkit
-    restart: always
+      - app-data:/home/user/.cbomkit
+    restart: unless-stopped
     deploy:
       resources:
         reservations:
           memory: 8g
         limits:
           memory: 16g
+
   frontend:
-    image: cbomkit-frontend
+    image: pqnext-cbomkit-frontend
     environment:
       VUE_APP_HTTP_API_BASE: "https://${SERVER_IP:?SERVER_IP must be set}/"
       VUE_APP_WS_API_BASE: "wss://${SERVER_IP:?SERVER_IP must be set}/"
-      VUE_APP_TITLE: "CBOMkit"
-      VUE_APP_VIEWER_ONLY: ${CBOMKIT_VIEWER}
+      VUE_APP_TITLE: PQNEXT-CBOMKit
+      VUE_APP_VIEWER_ONLY: ${CBOMKIT_VIEWER:-false}
       VUE_APP_POLICY_NAME: ${CBOMKIT_POLICY_NAME:-quantum_safe}
     expose:
       - "8000"
-    restart: always
+    restart: unless-stopped
+
   db:
     image: docker.io/library/postgres:16-alpine
     user: postgres
     environment:
       POSTGRES_DB: postgres
-      POSTGRES_USER: ${POSTGRESQL_AUTH_USERNAME}
-      POSTGRES_PASSWORD: ${POSTGRESQL_AUTH_PASSWORD}
+      POSTGRES_USER: ${POSTGRESQL_AUTH_USERNAME:-cbomkit}
+      POSTGRES_PASSWORD: ${POSTGRESQL_AUTH_PASSWORD:-cbomkit}
     expose:
       - "5432"
     healthcheck:
-      test: [ "CMD", "pg_isready -U ${POSTGRESQL_AUTH_USERNAME} -d postgres" ]
+      test: ["CMD-SHELL", "pg_isready -U '$${POSTGRES_USER}' -d '$${POSTGRES_DB}'"]
       interval: 10s
       timeout: 5s
       retries: 5
     volumes:
-      - "pg-volume:/var/lib/postgresql/data/"
-    restart: always
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
   opa:
     image: docker.io/openpolicyagent/opa:1.15.1
-    command:
-      - "run"
-      - "--addr=0.0.0.0:8181"
-      - "--server"
-      - "/policies"
+    command: ["run", "--addr=0.0.0.0:8181", "--server", "/policies"]
     expose:
       - "8181"
     volumes:
-      - "${PWD}/opa:/policies"
+      - ./opa:/policies:ro
+    restart: unless-stopped
+
   nginx:
     image: docker.io/library/nginx:1.30.4-alpine3.24
     depends_on:
-      - backend
-      - frontend
-    entrypoint:
-      - /usr/sbin/nginx
-    command:
-      - -g
-      - daemon off;
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+    entrypoint: ["/usr/sbin/nginx"]
+    command: ["-g", "daemon off;"]
     ports:
       - "443:443"
       - "8443:8443"
     volumes:
-      - "./nginx.conf:/etc/nginx/nginx.conf:ro"
-      - type: bind
-        source: ${PKI_DIR:-./pki}/server.crt
-        target: /etc/nginx/pki/server.crt
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PKI_DIR:-./pki}/server.key
-        target: /etc/nginx/pki/server.key
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PKI_DIR:-./pki}/ca.crt
-        target: /etc/nginx/pki/ca.crt
-        read_only: true
-        bind:
-          create_host_path: false
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-pki:/etc/nginx/pki:ro
     read_only: true
     tmpfs:
       - /var/cache/nginx:rw,noexec,nosuid,size=64m
@@ -126,7 +125,162 @@ services:
       - SETUID
     security_opt:
       - no-new-privileges:true
-    restart: always
+    restart: unless-stopped
+
+  step-ca:
+    <<: *pki-image
+    profiles: ["managed-pki"]
+    user: "1000:1000"
+    command: ["serve"]
+    environment: *pki-environment
+    ports:
+      - "${STEP_CA_HOST_PORT:-9000}:9000"
+    volumes:
+      - ca-data:/var/lib/pqnext-cbomkit-ca
+      - ca-password:/run/ca-password:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "step", "ca", "health", "--ca-url", "https://localhost:9000", "--root", "/var/lib/pqnext-cbomkit-ca/current/certs/root_ca.crt"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+
+  ca-init:
+    <<: *pki-image
+    profiles: ["pki-tools"]
+    user: "0:0"
+    command: ["init"]
+    environment: *pki-environment
+    volumes:
+      - ca-data:/var/lib/pqnext-cbomkit-ca
+      - ca-password:/run/ca-password
+      - ca-admin-password:/run/admin-password
+      - ca-client-password:/run/client-password
+      - ca-server-password:/run/server-password
+      - ca-public:/public
+      - ca-root-bootstrap:/bootstrap
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+      - /run:rw,noexec,nosuid,size=1m
+
+  root-export:
+    <<: *pki-image
+    profiles: ["pki-tools"]
+    user: "0:0"
+    command: ["export-root"]
+    environment: *pki-environment
+    volumes:
+      - ca-root-bootstrap:/bootstrap:ro
+    read_only: true
+
+  ca-export:
+    <<: *pki-image
+    profiles: ["pki-tools"]
+    user: "1000:1000"
+    command: ["export-ca"]
+    environment: *pki-environment
+    volumes:
+      - ca-public:/public:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=4m
+
+  ca-finalize:
+    <<: *pki-image
+    profiles: ["pki-tools"]
+    user: "0:0"
+    command: ["finalize"]
+    environment: *pki-environment
+    volumes:
+      - ca-data:/var/lib/pqnext-cbomkit-ca
+    read_only: true
+
+  ca-configure:
+    <<: *pki-image
+    profiles: ["pki-tools"]
+    user: "1000:1000"
+    command: ["configure"]
+    environment: *pki-environment
+    volumes:
+      - ca-admin-password:/run/admin-password:ro
+      - ca-client-password:/run/client-password:ro
+      - ca-server-password:/run/server-password:ro
+      - ca-public:/public:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+
+  nginx-cert-init:
+    <<: *pki-image
+    profiles: ["pki-tools"]
+    user: "0:0"
+    command: ["issue-nginx"]
+    environment: *pki-environment
+    volumes:
+      - ca-server-password:/run/server-password:ro
+      - ca-public:/public:ro
+      - nginx-pki:/pki
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+
+  pki-import:
+    <<: *pki-image
+    profiles: ["pki-tools"]
+    user: "0:0"
+    command: ["import-pki"]
+    environment: *pki-environment
+    volumes:
+      - nginx-pki:/pki
+    read_only: true
+
+  client-token:
+    <<: *pki-image
+    profiles: ["pki-tools"]
+    user: "1000:1000"
+    command: ["client-token"]
+    environment: *pki-environment
+    volumes:
+      - ca-client-password:/run/client-password:ro
+      - ca-public:/public:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+
 volumes:
-  cbomkit-volume:
-  pg-volume:
+  app-data:
+    name: pqnext-cbomkit-app-data
+  postgres-data:
+    name: pqnext-cbomkit-postgres-data
+  ca-data:
+    name: pqnext-cbomkit-ca-data
+    external: true
+  ca-password:
+    name: pqnext-cbomkit-ca-password
+    external: true
+  ca-admin-password:
+    name: pqnext-cbomkit-ca-admin-password
+    external: true
+  ca-client-password:
+    name: pqnext-cbomkit-ca-client-password
+    external: true
+  ca-server-password:
+    name: pqnext-cbomkit-ca-server-password
+    external: true
+  ca-public:
+    name: pqnext-cbomkit-ca-public
+    external: true
+  ca-root-bootstrap:
+    name: ${PQNEXT_CBOMKIT_BOOTSTRAP_VOLUME:-pqnext-cbomkit-ca-root-bootstrap-unused}
+    external: true
+  nginx-pki:
+    name: pqnext-cbomkit-nginx-pki
+    external: true

@@ -26,11 +26,25 @@ jobs:
       - name: Install YAML linter
         run: pipx install yamllint
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
       - name: Lint YAML
         run: >-
           yamllint -d relaxed
           docker-compose.yml
+          .github/workflows/release-cli.yml
           .github/workflows/validate.yml
+
+      - name: Test management CLI
+        run: |
+          go test ./...
+          go vet ./...
+
+      - name: Check container scripts
+        run: bash -n step-ca/bin/pqnext-cbomkit-pki
 
       - name: Validate Docker Compose
         env:
@@ -38,5 +52,11 @@ jobs:
           POSTGRESQL_AUTH_USERNAME: ci-user
           POSTGRESQL_AUTH_PASSWORD: ci-password
           CBOMKIT_VIEWER: "false"
-          PKI_DIR: ./pki
-        run: docker compose config --quiet
+        run: |
+          docker compose config --quiet
+          docker compose --profile managed-pki --profile pki-tools config --quiet
+
+      - name: Build PKI image
+        run: >-
+          docker build --file step-ca/Dockerfile
+          --tag pqnext-cbomkit-step-ca:ci .

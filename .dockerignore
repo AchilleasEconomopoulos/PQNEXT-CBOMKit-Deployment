@@ -1,0 +1,11 @@
+# Default-deny the build context so operator inputs and local state can never be
+# uploaded to the Docker builder merely because they live under the project.
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!step-ca/
+!step-ca/**

@@ -1,3 +1,6 @@
 .env
+.pqnext-cbomkit-state.json
+*.token
 pki/*
 !pki/README.md
+pqnext-cbomkitctl

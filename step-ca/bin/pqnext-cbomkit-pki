@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# All step CLI scratch/config state belongs in a per-container tmpfs. The CA
+# server itself is given an explicit configuration path below.
+export STEPPATH=/tmp/step
+
+ca_base=/var/lib/pqnext-cbomkit-ca
+generation="$ca_base/generations/v1"
+bootstrap=/bootstrap
+public_dir=/public
+ca_url=https://step-ca:9000
+root_cert="$public_dir/root_ca.crt"
+root_password_file=
+
+die() {
+  echo "pqnext-cbomkit-pki: $*" >&2
+  exit 1
+}
+
+require_file() {
+  [[ -s "$1" ]] || die "required file is missing: $1"
+}
+
+assert_root_offline() {
+  [[ ! -e "$generation/secrets/root_ca_key" ]] || die "refusing operation: root private key exists in online CA state"
+  if find "$ca_base" -xdev -type f -name '*root*key*' -print -quit 2>/dev/null | grep -q .; then
+    die "refusing operation: a root-key-shaped file exists in online CA storage"
+  fi
+}
+
+cleanup_init() {
+  if [[ -n "$root_password_file" ]]; then
+    rm -f "$root_password_file"
+  fi
+  if [[ ! -f "$ca_base/.pending-export" ]]; then
+    rm -rf "$generation"
+  fi
+}
+
+make_secret() {
+  local directory="$1" destination temporary
+  destination="$directory/password"
+  if [[ -s "$destination" ]]; then
+    [[ "$(wc -c <"$destination" | tr -d ' ')" = 65 ]] || die "stored role secret has an invalid length: $destination"
+    grep -Eq '^[[:alnum:]]{64}$' "$destination" || die "stored role secret has an invalid format: $destination"
+    chown 1000:1000 "$directory" "$destination"
+    chmod 0700 "$directory"
+    chmod 0400 "$destination"
+    return
+  fi
+  mkdir -p "$directory"
+  chown 1000:1000 "$directory"
+  chmod 0700 "$directory"
+  temporary=$(mktemp "$directory/.password.XXXXXX")
+  step crypto rand --format alphanumeric 64 >"$temporary"
+  chown 1000:1000 "$temporary"
+  chmod 0400 "$temporary"
+  mv "$temporary" "$destination"
+}
+
+init_ca() {
+  mkdir -p "$ca_base" "$ca_base/generations" "$bootstrap" "$public_dir"
+  exec 9>"$ca_base/.init.lock"
+  flock 9
+
+  if [[ -f "$ca_base/.ready" ]]; then
+    assert_root_offline
+    return
+  fi
+  if [[ -f "$ca_base/.pending-export" ]]; then
+    require_file "$bootstrap/pqnext-cbomkit-root-recovery.tar.gz"
+    assert_root_offline
+    return
+  fi
+  local dns_names root_fingerprint created_at staging cert_public key_public generation_complete intermediate_cert_fingerprint intermediate_key_fingerprint
+  root_password_file=$(mktemp /run/pqnext-cbomkit-root-password.XXXXXX)
+  chmod 0600 "$root_password_file"
+  trap cleanup_init EXIT
+  cat >"$root_password_file"
+  [[ -s "$root_password_file" ]] || die "root recovery passphrase was not provided on stdin"
+
+  make_secret /run/ca-password
+  make_secret /run/admin-password
+  make_secret /run/client-password
+  make_secret /run/server-password
+  [[ "$(sha256sum /run/ca-password/password /run/admin-password/password /run/client-password/password /run/server-password/password | cut -d' ' -f1 | sort -u | wc -l | tr -d ' ')" = 4 ]] \
+    || die "role-specific CA secrets are not distinct"
+
+  if [[ -e "$bootstrap/root_ca.crt" || -e "$bootstrap/root_ca_key" ]]; then
+    [[ -s "$bootstrap/root_ca.crt" && -s "$bootstrap/root_ca_key" ]] || die "bootstrap storage contains only part of the root identity"
+    cert_public=$(mktemp /tmp/pqnext-cbomkit-cert-public.XXXXXX)
+    key_public=$(mktemp /tmp/pqnext-cbomkit-key-public.XXXXXX)
+    step crypto key public "$bootstrap/root_ca.crt" >"$cert_public"
+    step crypto key public "$bootstrap/root_ca_key" --password-file "$root_password_file" >"$key_public"
+    cmp -s "$cert_public" "$key_public" || die "root recovery passphrase is wrong or the root certificate and key do not match"
+    rm -f "$cert_public" "$key_public"
+    step certificate verify "$bootstrap/root_ca.crt" --roots "$bootstrap/root_ca.crt"
+  else
+    step certificate create "${STEP_CA_NAME:-PQNEXT-CBOMKit Root CA}" \
+      "$bootstrap/root_ca.crt" "$bootstrap/root_ca_key" \
+      --profile root-ca \
+      --password-file "$root_password_file" \
+      --not-after 87600h
+    chmod 0600 "$bootstrap/root_ca_key"
+    chmod 0644 "$bootstrap/root_ca.crt"
+  fi
+
+  dns_names="step-ca,localhost,127.0.0.1,${SERVER_IP:?SERVER_IP is required}"
+  if [[ -n "${SERVER_DNS_NAME:-}" ]]; then
+    dns_names="$dns_names,$SERVER_DNS_NAME"
+  fi
+  if [[ -n "${STEP_CA_DNS_NAMES:-}" ]]; then
+    dns_names="$dns_names,$STEP_CA_DNS_NAMES"
+  fi
+
+  generation_complete=false
+  if [[ -e "$generation" ]]; then
+    if [[ -s "$generation/config/ca.json" && -s "$generation/certs/intermediate_ca.crt" && -s "$generation/secrets/intermediate_ca_key" && ! -e "$generation/secrets/root_ca_key" ]] \
+      && intermediate_cert_fingerprint=$(step crypto key fingerprint "$generation/certs/intermediate_ca.crt") \
+      && intermediate_key_fingerprint=$(step crypto key fingerprint "$generation/secrets/intermediate_ca_key" --password-file /run/ca-password/password) \
+      && [[ "$intermediate_cert_fingerprint" = "$intermediate_key_fingerprint" ]] \
+      && step certificate verify "$generation/certs/intermediate_ca.crt" --roots "$bootstrap/root_ca.crt"; then
+      generation_complete=true
+    else
+      rm -rf "$generation"
+    fi
+  fi
+  if [[ "$generation_complete" != true ]]; then
+    mkdir -p "$generation"
+    STEPPATH="$generation" step ca init \
+      --name "${STEP_CA_NAME:-PQNEXT-CBOMKit CA}" \
+      --deployment-type standalone \
+      --dns "$dns_names" \
+      --address :9000 \
+      --provisioner pqnext-cbomkit-admin \
+      --password-file /run/ca-password/password \
+      --provisioner-password-file /run/admin-password/password \
+      --root "$bootstrap/root_ca.crt" \
+      --key "$bootstrap/root_ca_key" \
+      --key-password-file "$root_password_file" \
+      --remote-management
+  fi
+
+  [[ ! -e "$generation/secrets/root_ca_key" ]] || die "step-ca copied the root private key into online storage"
+  step certificate verify "$generation/certs/intermediate_ca.crt" --roots "$bootstrap/root_ca.crt"
+  cp "$bootstrap/root_ca.crt" "$public_dir/root_ca.crt"
+  cp "$generation/certs/intermediate_ca.crt" "$public_dir/intermediate_ca.crt"
+  chmod 0644 "$public_dir/root_ca.crt" "$public_dir/intermediate_ca.crt"
+  root_fingerprint=$(step certificate fingerprint "$bootstrap/root_ca.crt")
+  printf '%s\n' "$root_fingerprint" >"$public_dir/fingerprint"
+  chmod 0644 "$public_dir/fingerprint"
+
+  created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  staging=$(mktemp -d "$bootstrap/.recovery.XXXXXX")
+  cp "$bootstrap/root_ca.crt" "$staging/root_ca.crt"
+  cp "$bootstrap/root_ca_key" "$staging/root_ca_key"
+  jq -n \
+    --arg fingerprint "$root_fingerprint" \
+    --arg ca_name "${STEP_CA_NAME:-PQNEXT-CBOMKit CA}" \
+    --arg created_at "$created_at" \
+    '{version: 1, fingerprint: $fingerprint, caName: $ca_name, createdAt: $created_at}' \
+    >"$staging/manifest.json"
+  (cd "$staging" && sha256sum root_ca.crt root_ca_key manifest.json >SHA256SUMS)
+  tar -C "$staging" -czf "$bootstrap/.recovery.tar.gz" root_ca.crt root_ca_key manifest.json SHA256SUMS
+  chmod 0600 "$bootstrap/.recovery.tar.gz"
+  mv "$bootstrap/.recovery.tar.gz" "$bootstrap/pqnext-cbomkit-root-recovery.tar.gz"
+  rm -rf "$staging"
+
+  chown -R 1000:1000 "$generation" "$public_dir"
+  if [[ ! -e "$ca_base/current" && ! -L "$ca_base/current" ]]; then
+    ln -s "generations/v1" "$ca_base/current"
+  elif [[ "$(readlink "$ca_base/current")" != "generations/v1" ]]; then
+    die "online CA current-generation link is unexpected"
+  fi
+  : >"$ca_base/.pending-export"
+  chown 1000:1000 "$ca_base/.pending-export" "$ca_base/.init.lock"
+  assert_root_offline
+  rm -f "$root_password_file"
+  root_password_file=
+  trap - EXIT
+  echo "Managed CA initialized; encrypted root awaits recovery export." >&2
+}
+
+export_root() {
+  require_file "$bootstrap/pqnext-cbomkit-root-recovery.tar.gz"
+  cat "$bootstrap/pqnext-cbomkit-root-recovery.tar.gz"
+}
+
+export_ca() {
+  require_file "$root_cert"
+  require_file "$public_dir/fingerprint"
+  local expected actual
+  expected=$(tr -d '[:space:]' <"$public_dir/fingerprint")
+  actual=$(step certificate fingerprint "$root_cert")
+  [[ -n "$expected" && "$actual" == "$expected" ]] || die "public root certificate fingerprint does not match managed CA metadata"
+  step certificate verify "$root_cert" --roots "$root_cert"
+  cat "$root_cert"
+}
+
+finalize_ca() {
+  if [[ -f "$ca_base/.ready" ]]; then
+    assert_root_offline
+    return
+  fi
+  [[ -f "$ca_base/.pending-export" ]] || die "managed CA has no pending recovery export"
+  require_file "$ca_base/current/config/ca.json"
+  assert_root_offline
+  : >"$ca_base/.ready"
+  chown 1000:1000 "$ca_base/.ready"
+  rm -f "$ca_base/.pending-export"
+  echo "Managed CA generation is active." >&2
+}
+
+serve_ca() {
+  [[ -f "$ca_base/.ready" ]] || die "managed CA is not finalized"
+  require_file "$ca_base/current/config/ca.json"
+  require_file /run/ca-password/password
+  assert_root_offline
+  exec step-ca --password-file /run/ca-password/password "$ca_base/current/config/ca.json"
+}
+
+wait_for_ca() {
+  local attempt
+  for attempt in $(seq 1 60); do
+    if step ca health --ca-url "$ca_url" --root "$root_cert" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 1
+  done
+  die "step-ca did not become healthy"
+}
+
+provisioner_exists() {
+  local name="$1"
+  step ca provisioner list --ca-url "$ca_url" --root "$root_cert" \
+    | jq -e --arg name "$name" 'any(.[]; .name == $name)' >/dev/null
+}
+
+add_provisioner() {
+  local name="$1" password="$2" template="$3"
+  if provisioner_exists "$name"; then
+    return
+  fi
+  step ca provisioner add "$name" \
+    --type JWK \
+    --create \
+    --password-file "$password" \
+    --x509-template "$template" \
+    --x509-min-dur 5m \
+    --x509-default-dur 24h \
+    --x509-max-dur 24h \
+    --admin-subject step \
+    --admin-provisioner pqnext-cbomkit-admin \
+    --admin-password-file /run/admin-password/password \
+    --ca-url "$ca_url" \
+    --root "$root_cert"
+}
+
+configure_ca() {
+  require_file /run/admin-password/password
+  require_file /run/client-password/password
+  require_file /run/server-password/password
+  require_file "$root_cert"
+  wait_for_ca
+  add_provisioner pqnext-cbomkit-machine-clients /run/client-password/password /usr/local/share/pqnext-cbomkit/templates/client.tpl
+  add_provisioner pqnext-cbomkit-servers /run/server-password/password /usr/local/share/pqnext-cbomkit/templates/server.tpl
+  echo "Managed PKI provisioners are configured." >&2
+}
+
+issue_nginx() {
+  require_file /run/server-password/password
+  require_file "$root_cert"
+  require_file "$public_dir/intermediate_ca.crt"
+  wait_for_ca
+  if pqnext-cbomkitctl internal-validate-pki --dir /pki/current --server-ip "$SERVER_IP" --server-dns "${SERVER_DNS_NAME:-}" >/dev/null 2>&1; then
+    echo "Existing NGINX identity is valid; preserving it." >&2
+    return
+  fi
+
+  local work
+  work=$(mktemp -d /tmp/pqnext-cbomkit-nginx.XXXXXX)
+  trap "rm -rf '$work'" EXIT
+  local -a san_args=(--san localhost --san 127.0.0.1 --san "$SERVER_IP")
+  if [[ -n "${SERVER_DNS_NAME:-}" ]]; then
+    san_args+=(--san "$SERVER_DNS_NAME")
+  fi
+  step ca certificate pqnext-cbomkit-nginx "$work/leaf.crt" "$work/server.key" \
+    --ca-url "$ca_url" \
+    --root "$root_cert" \
+    --provisioner pqnext-cbomkit-servers \
+    --provisioner-password-file /run/server-password/password \
+    "${san_args[@]}"
+  # step ca certificate writes the leaf followed by its issuing intermediate.
+  # Keep that complete chain as-is; appending the intermediate again would make
+  # the importer reject the duplicate as a broken adjacent chain.
+  mv "$work/leaf.crt" "$work/server.crt"
+  cp "$root_cert" "$work/ca.crt"
+  pqnext-cbomkitctl internal-install-pki \
+    --target /pki \
+    --server-cert "$work/server.crt" \
+    --server-key "$work/server.key" \
+    --client-ca "$work/ca.crt" \
+    --server-ip "$SERVER_IP" \
+    --server-dns "${SERVER_DNS_NAME:-}" \
+    --source managed
+  echo "NGINX identity was issued and validated." >&2
+}
+
+import_pki() {
+  exec pqnext-cbomkitctl internal-import-pki \
+    --target /pki \
+    --server-ip "${SERVER_IP:?SERVER_IP is required}" \
+    --server-dns "${SERVER_DNS_NAME:-}" \
+    --source external
+}
+
+client_token() {
+  [[ $# -eq 1 ]] || die "client-token requires exactly one identity"
+  require_file /run/client-password/password
+  require_file "$root_cert"
+  wait_for_ca
+  exec step ca token "$1" \
+    --ca-url "$ca_url" \
+    --root "$root_cert" \
+    --provisioner pqnext-cbomkit-machine-clients \
+    --provisioner-password-file /run/client-password/password
+}
+
+case "${1:-serve}" in
+  init) init_ca ;;
+  export-root) export_root ;;
+  export-ca) export_ca ;;
+  finalize) finalize_ca ;;
+  serve) serve_ca ;;
+  configure) configure_ca ;;
+  issue-nginx) issue_nginx ;;
+  import-pki) import_pki ;;
+  client-token) shift; client_token "$@" ;;
+  *) die "unknown operation: $1" ;;
+esac

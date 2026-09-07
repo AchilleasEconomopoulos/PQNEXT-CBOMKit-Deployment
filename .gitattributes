@@ -1,0 +1,6 @@
+* text=auto
+*.sh text eol=lf
+*.yml text eol=lf
+Dockerfile text eol=lf
+step-ca/bin/pqnext-cbomkit-pki text eol=lf
+step-ca/templates/*.tpl text eol=lf
