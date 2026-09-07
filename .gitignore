@@ -3,4 +3,4 @@
 *.token
 pki/*
 !pki/README.md
-pqnext-cbomkitctl
+/pqnext-cbomkitctl
