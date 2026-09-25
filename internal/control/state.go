@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 const stateVersion = 1
@@ -20,12 +21,20 @@ type deploymentState struct {
 	BootstrapVolume string `json:"bootstrapVolume,omitempty"`
 }
 
-func statePath(projectDir string) string {
-	return filepath.Join(projectDir, ".pqnext-cbomkit-state.json")
+func statePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("locating user home directory: %w", err)
+	}
+	return filepath.Join(home, ".pqnext", "cbomkit", "state.json"), nil
 }
 
-func loadState(projectDir string) (*deploymentState, error) {
-	data, err := os.ReadFile(statePath(projectDir))
+func loadState() (*deploymentState, error) {
+	path, err := statePath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -48,15 +57,29 @@ func loadState(projectDir string) (*deploymentState, error) {
 	return &state, nil
 }
 
-func saveState(projectDir string, state deploymentState) error {
+func saveState(state deploymentState) error {
 	state.Version = stateVersion
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding deployment state: %w", err)
 	}
 	data = append(data, '\n')
-	path := statePath(projectDir)
-	tmp, err := os.CreateTemp(projectDir, ".pqnext-cbomkit-state-*")
+	path, err := statePath()
+	if err != nil {
+		return err
+	}
+	stateDir := filepath.Dir(path)
+	for _, dir := range []string{filepath.Dir(stateDir), stateDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("creating state directory: %w", err)
+		}
+		if runtime.GOOS != "windows" {
+			if err := os.Chmod(dir, 0o700); err != nil {
+				return fmt.Errorf("securing state directory: %w", err)
+			}
+		}
+	}
+	tmp, err := os.CreateTemp(stateDir, ".state-*")
 	if err != nil {
 		return fmt.Errorf("creating deployment state: %w", err)
 	}

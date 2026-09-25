@@ -123,6 +123,8 @@ func (a *app) run(ctx context.Context, args []string) error {
 		return a.up(ctx, args[1:])
 	case "down":
 		return a.down(ctx, args[1:])
+	case "uninstall":
+		return a.uninstall(ctx, args[1:])
 	case "status":
 		return a.status(ctx, args[1:])
 	case "pki":
@@ -161,11 +163,16 @@ func printUsage(w io.Writer) {
   pqnext-cbomkitctl [--project-dir PATH] install --pki managed --server-ip ADDRESS [options]
   pqnext-cbomkitctl [--project-dir PATH] install --pki external --server-ip ADDRESS --server-cert PATH --server-key PATH --client-ca PATH
   pqnext-cbomkitctl [--project-dir PATH] up|down|status
+  pqnext-cbomkitctl [--project-dir PATH] uninstall [--yes]
   pqnext-cbomkitctl [--project-dir PATH] pki import --server-cert PATH --server-key PATH --client-ca PATH
   pqnext-cbomkitctl [--project-dir PATH] pki export-ca --output PATH
   pqnext-cbomkitctl [--project-dir PATH] pki distribute-ca --hosts PATH
   pqnext-cbomkitctl [--project-dir PATH] pki reinit-ca --server-ip ADDRESS [--server-dns NAME] [--recovery-dir PATH] [--root-password-file PATH] [--yes]
-  pqnext-cbomkitctl [--project-dir PATH] client-token --name NAME [--output PATH]`)
+  pqnext-cbomkitctl [--project-dir PATH] client-token --name NAME [--output PATH]
+
+Uninstall removes the deployment's containers, network, data and PKI volumes,
+home-directory state, and its verified recorded recovery archive. Run it from
+the deployment checkout or provide --project-dir PATH.`)
 }
 
 type installOptions struct {
@@ -200,7 +207,7 @@ func (a *app) install(ctx context.Context, args []string) error {
 	if err := validateInstallOptions(options); err != nil {
 		return err
 	}
-	state, err := loadState(a.projectDir)
+	state, err := loadState()
 	if err != nil {
 		return err
 	}
@@ -239,7 +246,7 @@ func (a *app) install(ctx context.Context, args []string) error {
 			if err := a.refuseExistingDeploymentVolumes(ctx, []string{"pqnext-cbomkit-nginx-pki"}); err != nil {
 				return err
 			}
-			if err := saveState(a.projectDir, *state); err != nil {
+			if err := saveState(*state); err != nil {
 				return err
 			}
 		}
@@ -266,7 +273,7 @@ func (a *app) install(ctx context.Context, args []string) error {
 		if err := a.refuseExistingDeploymentVolumes(ctx, managedVolumes); err != nil {
 			return err
 		}
-		if err := saveState(a.projectDir, *state); err != nil {
+		if err := saveState(*state); err != nil {
 			return err
 		}
 	}
@@ -311,7 +318,7 @@ func (a *app) install(ctx context.Context, args []string) error {
 		}
 		state.RootFingerprint = manifest.Fingerprint
 		state.RecoveryArchive = archivePath
-		if err := saveState(a.projectDir, *state); err != nil {
+		if err := saveState(*state); err != nil {
 			return err
 		}
 	}
@@ -357,7 +364,7 @@ func (a *app) reinitializeCA(ctx context.Context, args []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected pki reinit-ca arguments: %s", strings.Join(fs.Args(), " "))
 	}
-	state, err := loadState(a.projectDir)
+	state, err := loadState()
 	if err != nil {
 		return err
 	}
@@ -419,7 +426,7 @@ func (a *app) reinitializeCA(ctx context.Context, args []string) error {
 	state.RootFingerprint = ""
 	state.RecoveryArchive = ""
 	state.BootstrapVolume = newBootstrap
-	if err := saveState(a.projectDir, *state); err != nil {
+	if err := saveState(*state); err != nil {
 		return err
 	}
 	a.rootPassword = password
@@ -675,6 +682,11 @@ func zeroBytes(value []byte) {
 }
 
 func saveRecoveryArchive(dir, fingerprint string, data []byte) (string, error) {
+	var err error
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("resolving recovery directory: %w", err)
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("creating recovery directory: %w", err)
 	}
@@ -730,7 +742,7 @@ func (a *app) importExternal(ctx context.Context, args []string) error {
 	if fs.NArg() != 0 || cert == "" || key == "" || ca == "" {
 		return errors.New("pki import requires --server-cert, --server-key, and --client-ca")
 	}
-	state, err := loadState(a.projectDir)
+	state, err := loadState()
 	if err != nil {
 		return err
 	}
@@ -778,7 +790,7 @@ func (a *app) up(ctx context.Context, args []string) error {
 	if len(args) != 0 {
 		return errors.New("up accepts no arguments")
 	}
-	state, err := loadState(a.projectDir)
+	state, err := loadState()
 	if err != nil {
 		return err
 	}
@@ -797,7 +809,7 @@ func (a *app) down(ctx context.Context, args []string) error {
 	if len(args) != 0 {
 		return errors.New("down accepts no arguments")
 	}
-	state, err := loadState(a.projectDir)
+	state, err := loadState()
 	if err != nil {
 		return err
 	}
@@ -816,7 +828,7 @@ func (a *app) status(ctx context.Context, args []string) error {
 	if len(args) != 0 {
 		return errors.New("status accepts no arguments")
 	}
-	state, err := loadState(a.projectDir)
+	state, err := loadState()
 	if err != nil {
 		return err
 	}
@@ -840,7 +852,7 @@ func (a *app) clientToken(ctx context.Context, args []string) error {
 	if fs.NArg() != 0 || !safeClientName.MatchString(name) {
 		return errors.New("--name must be 1-128 letters, digits, dots, underscores, or hyphens and start with a letter or digit")
 	}
-	state, err := loadState(a.projectDir)
+	state, err := loadState()
 	if err != nil {
 		return err
 	}
@@ -889,7 +901,7 @@ func (a *app) exportCA(ctx context.Context, args []string) error {
 }
 
 func (a *app) managedCACertificate(ctx context.Context) ([]byte, string, error) {
-	state, err := loadState(a.projectDir)
+	state, err := loadState()
 	if err != nil {
 		return nil, "", err
 	}

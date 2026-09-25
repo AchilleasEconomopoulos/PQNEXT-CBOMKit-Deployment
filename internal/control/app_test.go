@@ -24,6 +24,14 @@ type recordingRunner struct {
 	calls []runnerCall
 }
 
+func setTestStateHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	return home
+}
+
 func (r *recordingRunner) Run(_ context.Context, dir string, env map[string]string, input io.Reader, _, _ io.Writer, name string, args ...string) error {
 	var inputBytes []byte
 	if input != nil {
@@ -151,19 +159,23 @@ func TestDefaultRecoveryDirectories(t *testing.T) {
 }
 
 func TestStateRejectsPKIModeChange(t *testing.T) {
-	dir := t.TempDir()
+	setTestStateHome(t)
 	state := deploymentState{PKIMode: "managed", ServerIP: "192.0.2.10"}
-	if err := saveState(dir, state); err != nil {
+	if err := saveState(state); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := loadState(dir)
+	loaded, err := loadState()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if loaded.PKIMode != "managed" {
 		t.Fatalf("mode = %q", loaded.PKIMode)
 	}
-	info, err := osStat(statePath(dir))
+	path, err := statePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := osStat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,13 +201,14 @@ func TestInternalCommandDoesNotRequireComposeFile(t *testing.T) {
 }
 
 func TestReinitializeCAResetsOnlyPKIVolumesAndRecordsNewIdentity(t *testing.T) {
+	setTestStateHome(t)
 	dir := t.TempDir()
 	passwordFile := filepath.Join(dir, "password")
 	if err := os.WriteFile(passwordFile, []byte("new-root-passphrase"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	oldBootstrap := "pqnext-cbomkit-ca-root-bootstrap-0123456789abcdef"
-	if err := saveState(dir, deploymentState{PKIMode: "managed", ServerIP: "192.0.2.10", ServerDNS: "cbomkit.example", RootFingerprint: strings.Repeat("a", 64), RecoveryArchive: "/old/recovery.tar.gz", BootstrapVolume: oldBootstrap}); err != nil {
+	if err := saveState(deploymentState{PKIMode: "managed", ServerIP: "192.0.2.10", ServerDNS: "cbomkit.example", RootFingerprint: strings.Repeat("a", 64), RecoveryArchive: "/old/recovery.tar.gz", BootstrapVolume: oldBootstrap}); err != nil {
 		t.Fatal(err)
 	}
 	runner := &recordingRunner{}
@@ -204,7 +217,7 @@ func TestReinitializeCAResetsOnlyPKIVolumesAndRecordsNewIdentity(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "validating exported root recovery archive") {
 		t.Fatalf("expected fake export to fail after reset, got %v", err)
 	}
-	state, err := loadState(dir)
+	state, err := loadState()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,9 +240,10 @@ func TestReinitializeCAResetsOnlyPKIVolumesAndRecordsNewIdentity(t *testing.T) {
 }
 
 func TestReinitializeCARequiresTerminalOrYes(t *testing.T) {
+	setTestStateHome(t)
 	runner := &recordingRunner{}
 	a := &app{projectDir: t.TempDir(), runner: runner, stdin: bytes.NewReader(nil), stdout: io.Discard, stderr: io.Discard}
-	if err := saveState(a.projectDir, deploymentState{PKIMode: "managed", ServerIP: "192.0.2.10"}); err != nil {
+	if err := saveState(deploymentState{PKIMode: "managed", ServerIP: "192.0.2.10"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.reinitializeCA(context.Background(), []string{"--server-ip", "192.0.2.20"}); err == nil || !strings.Contains(err.Error(), "--yes") {

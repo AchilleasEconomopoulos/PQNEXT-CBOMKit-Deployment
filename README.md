@@ -159,8 +159,27 @@ pqnext-cbomkitctl status
 pqnext-cbomkitctl down
 ```
 
+To remove the deployment and its data, run:
+
+```text
+pqnext-cbomkitctl uninstall
+```
+
+Run this from the deployment checkout or pass `--project-dir PATH`. Type
+`uninstall` at the prompt, or pass `--yes` for unattended use. The command
+removes the Compose containers and network, all application, database, and PKI
+volumes, `~/.pqnext/cbomkit/state.json`, and the matching encrypted root
+recovery archive recorded in that state. It also works after a partial install
+with no readable state. In that case, custom recovery archives and other host
+files cannot be identified and must be removed manually. Docker images, the
+deployment checkout, `.env`, the old project-local state file, and separately
+exported certificates or tokens remain.
+
 The chosen PKI mode and server identity are recorded in
-`.pqnext-cbomkit-state.json`. Reinstalling is idempotent; changing mode or server
+`~/.pqnext/cbomkit/state.json` for the user running the CLI. The CLI creates
+`~/.pqnext/cbomkit` with private permissions and uses platform-native paths on
+non-Unix hosts. Run subsequent commands as the same user; `sudo` may select a
+different home directory. Reinstalling is idempotent; changing mode or server
 identity through `install` is rejected. Use `pki reinit-ca` to replace a managed
 CA and change its server identity.
 
