@@ -72,6 +72,49 @@ The CLI validates the self-signed CA certificate and checks its fingerprint
 against deployment state before atomically writing the public file. Distribute
 this certificate only; never distribute the root recovery archive.
 
+To copy the current public root certificate to SSH hosts, create a hosts file:
+
+```text
+# One user@host per line; blank lines are allowed
+alice@192.0.2.21
+scanner@192.0.2.22
+scanner@client.example.com
+```
+
+Then run:
+
+```text
+pqnext-cbomkitctl pki distribute-ca --hosts hosts.txt
+```
+
+The command validates every host entry and the root fingerprint, creates
+`~/.config/pqnext/` on each remote host, then copies `ca.crt` there with `scp`.
+It uses normal SSH
+host-key verification and authentication. It attempts every host, reports
+failures, and returns a nonzero exit code if any copy fails. Copying the file
+does not automatically add it to a system trust store; configure each client
+to use the copied certificate. The encrypted recovery archive is never sent.
+
+To replace the managed CA after the VM address changes, run:
+
+```text
+pqnext-cbomkitctl pki reinit-ca --server-ip 192.0.2.20 \
+  --server-dns pqnext-cbomkit.example
+```
+
+This stops the deployment, removes its managed CA and NGINX PKI volumes, and
+creates a new root, intermediate, server certificate, and recovery archive.
+On a terminal, the CLI asks you to type `reinit-ca` before making changes.
+Pass `--yes` to skip that prompt in an unattended run.
+Application and database volumes are preserved. The old recovery archive is
+also preserved on the host. Use `--root-password-file` and `--recovery-dir` for
+unattended runs, as with `install`. Existing client certificates and enrollment
+tokens stop working. Export the new root with `pki export-ca`, update client
+trust stores, and issue new `client-token` values to re-enroll clients. If a
+restart fails after the reset, rerun `install --pki managed` with the new IP and
+the same optional DNS name to finish initialization. When `--server-dns` is
+omitted, the recorded DNS name is retained; pass `--server-dns ""` to clear it.
+
 ## External PKI
 
 ```text
@@ -118,7 +161,8 @@ pqnext-cbomkitctl down
 
 The chosen PKI mode and server identity are recorded in
 `.pqnext-cbomkit-state.json`. Reinstalling is idempotent; changing mode or server
-identity is rejected because migration is not implemented.
+identity through `install` is rejected. Use `pki reinit-ca` to replace a managed
+CA and change its server identity.
 
 The PKI volumes are Docker-external and therefore survive
 `docker compose down -v`:

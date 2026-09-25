@@ -42,6 +42,7 @@ type app struct {
 	stdout          io.Writer
 	stderr          io.Writer
 	bootstrapVolume string
+	rootPassword    []byte
 }
 
 // Main is the command-line entry point. It returns a process exit code.
@@ -126,13 +127,17 @@ func (a *app) run(ctx context.Context, args []string) error {
 		return a.status(ctx, args[1:])
 	case "pki":
 		if len(args) < 2 {
-			return errors.New("usage: pqnext-cbomkitctl pki import ... | pki export-ca --output PATH")
+			return errors.New("usage: pqnext-cbomkitctl pki import ... | pki export-ca --output PATH | pki distribute-ca --hosts PATH | pki reinit-ca --server-ip ADDRESS [--yes]")
 		}
 		switch args[1] {
 		case "import":
 			return a.importExternal(ctx, args[2:])
 		case "export-ca":
 			return a.exportCA(ctx, args[2:])
+		case "distribute-ca":
+			return a.distributeCA(ctx, args[2:])
+		case "reinit-ca":
+			return a.reinitializeCA(ctx, args[2:])
 		default:
 			return fmt.Errorf("unknown pki command %q", args[1])
 		}
@@ -158,6 +163,8 @@ func printUsage(w io.Writer) {
   pqnext-cbomkitctl [--project-dir PATH] up|down|status
   pqnext-cbomkitctl [--project-dir PATH] pki import --server-cert PATH --server-key PATH --client-ca PATH
   pqnext-cbomkitctl [--project-dir PATH] pki export-ca --output PATH
+  pqnext-cbomkitctl [--project-dir PATH] pki distribute-ca --hosts PATH
+  pqnext-cbomkitctl [--project-dir PATH] pki reinit-ca --server-ip ADDRESS [--server-dns NAME] [--recovery-dir PATH] [--root-password-file PATH] [--yes]
   pqnext-cbomkitctl [--project-dir PATH] client-token --name NAME [--output PATH]`)
 }
 
@@ -270,9 +277,12 @@ func (a *app) install(ctx context.Context, args []string) error {
 		return err
 	}
 	if state.RootFingerprint == "" {
-		password, err := a.readRootPassword(options.rootPasswordFile)
-		if err != nil {
-			return err
+		password := a.rootPassword
+		if password == nil {
+			password, err = a.readRootPassword(options.rootPasswordFile)
+			if err != nil {
+				return err
+			}
 		}
 		defer zeroBytes(password)
 		if options.recoveryDir == "" {
@@ -327,6 +337,135 @@ func (a *app) install(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintf(a.stdout, "PQNEXT-CBOMKit is running with managed PKI.\nRoot fingerprint: %s\nRecovery archive: %s\n", state.RootFingerprint, state.RecoveryArchive)
 	return nil
+}
+
+// reinitializeCA replaces only managed PKI state. Application and database
+// volumes are deliberately outside this operation.
+func (a *app) reinitializeCA(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("pki reinit-ca", flag.ContinueOnError)
+	fs.SetOutput(a.stderr)
+	var serverIP, serverDNS, recoveryDir, rootPasswordFile string
+	var yes bool
+	fs.StringVar(&serverIP, "server-ip", "", "new server IP address")
+	fs.StringVar(&serverDNS, "server-dns", "", "optional new server DNS name")
+	fs.StringVar(&recoveryDir, "recovery-dir", "", "new root recovery directory")
+	fs.StringVar(&rootPasswordFile, "root-password-file", "", "file containing new root recovery passphrase")
+	fs.BoolVar(&yes, "yes", false, "skip interactive confirmation for unattended use")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected pki reinit-ca arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	state, err := loadState(a.projectDir)
+	if err != nil {
+		return err
+	}
+	if state == nil || state.PKIMode != "managed" {
+		return errors.New("pki reinit-ca requires an installed managed-PKI deployment")
+	}
+	dnsProvided := false
+	fs.Visit(func(value *flag.Flag) {
+		if value.Name == "server-dns" {
+			dnsProvided = true
+		}
+	})
+	if !dnsProvided {
+		serverDNS = state.ServerDNS
+	}
+	if err := validateInstallOptions(installOptions{mode: "managed", serverIP: serverIP, serverDNS: serverDNS}); err != nil {
+		return err
+	}
+	if err := a.confirmCAReset(yes); err != nil {
+		return err
+	}
+	if err := a.checkDocker(ctx); err != nil {
+		return err
+	}
+	password, err := a.readRootPassword(rootPasswordFile)
+	if err != nil {
+		return err
+	}
+	defer zeroBytes(password)
+	if recoveryDir == "" {
+		recoveryDir, err = currentDefaultRecoveryDir()
+		if err != nil {
+			return err
+		}
+	}
+	newBootstrap, err := newBootstrapVolumeName()
+	if err != nil {
+		return err
+	}
+	a.bootstrapVolume = state.BootstrapVolume
+	if err := a.compose(ctx, state.ServerIP, state.ServerDNS, nil, "--profile", "managed-pki", "down"); err != nil {
+		return fmt.Errorf("stopping deployment before CA reinitialization: %w", err)
+	}
+	volumes := append([]string{}, managedVolumes...)
+	if state.BootstrapVolume != "" {
+		volumes = append(volumes, state.BootstrapVolume)
+	}
+	for _, name := range volumes {
+		var discard bytes.Buffer
+		if err := a.runner.Run(ctx, a.projectDir, nil, nil, &discard, &discard, "docker", "volume", "inspect", name); err != nil {
+			continue
+		}
+		if err := a.runner.Run(ctx, a.projectDir, nil, nil, a.stdout, a.stderr, "docker", "volume", "rm", name); err != nil {
+			return fmt.Errorf("removing managed PKI volume %s: %w", name, err)
+		}
+	}
+	state.ServerIP = serverIP
+	state.ServerDNS = serverDNS
+	state.RootFingerprint = ""
+	state.RecoveryArchive = ""
+	state.BootstrapVolume = newBootstrap
+	if err := saveState(a.projectDir, *state); err != nil {
+		return err
+	}
+	a.rootPassword = password
+	defer func() { a.rootPassword = nil }()
+	installArgs := []string{"--pki", "managed", "--server-ip", serverIP, "--server-dns", serverDNS, "--recovery-dir", recoveryDir}
+	if err := a.install(ctx, installArgs); err != nil {
+		return fmt.Errorf("reinstalling managed PKI: %w; after resolving the error, retry install --pki managed with the new server identity", err)
+	}
+	fmt.Fprintln(a.stdout, "Managed CA was reinitialized. Export and distribute the new root certificate; re-enroll clients with new tokens.")
+	return nil
+}
+
+func (a *app) confirmCAReset(yes bool) error {
+	if yes {
+		return nil
+	}
+	input, ok := a.stdin.(*os.File)
+	if !ok || !term.IsTerminal(int(input.Fd())) {
+		return errors.New("interactive confirmation requires a terminal; pass --yes for unattended use")
+	}
+	return readCAResetConfirmation(input, a.stderr)
+}
+
+func readCAResetConfirmation(input io.Reader, prompt io.Writer) error {
+	fmt.Fprint(prompt, "This will replace the managed CA and invalidate existing client certificates and tokens. Type reinit-ca to continue: ")
+	var answer []byte
+	var one [1]byte
+	for len(answer) < 64 {
+		n, err := input.Read(one[:])
+		if n == 1 {
+			if one[0] == '\n' {
+				if string(bytes.TrimSpace(answer)) == "reinit-ca" {
+					return nil
+				}
+				return errors.New("CA reinitialization cancelled")
+			}
+			answer = append(answer, one[0])
+		}
+		if err != nil {
+			return fmt.Errorf("reading CA reinitialization confirmation: %w", err)
+		}
+		if n == 0 {
+			return errors.New("reading CA reinitialization confirmation: no input")
+		}
+	}
+	return errors.New("CA reinitialization confirmation is too long")
 }
 
 func (a *app) refuseExistingDeploymentVolumes(ctx context.Context, names []string) error {
@@ -738,32 +877,40 @@ func (a *app) exportCA(ctx context.Context, args []string) error {
 	if fs.NArg() != 0 || strings.TrimSpace(outputPath) == "" {
 		return errors.New("pki export-ca requires --output PATH")
 	}
-	state, err := loadState(a.projectDir)
+	certificate, fingerprint, err := a.managedCACertificate(ctx)
 	if err != nil {
 		return err
 	}
+	if err := atomicWriteFile(outputPath, certificate, 0o644); err != nil {
+		return err
+	}
+	fmt.Fprintf(a.stdout, "Exported managed root CA certificate: %s\nRoot fingerprint: %s\n", outputPath, fingerprint)
+	return nil
+}
+
+func (a *app) managedCACertificate(ctx context.Context) ([]byte, string, error) {
+	state, err := loadState(a.projectDir)
+	if err != nil {
+		return nil, "", err
+	}
 	if state == nil || state.PKIMode != "managed" {
-		return errors.New("pki export-ca is available only for an installed managed-PKI deployment")
+		return nil, "", errors.New("CA export and distribution require an installed managed-PKI deployment")
 	}
 	if state.RootFingerprint == "" {
-		return errors.New("managed-PKI deployment state has no root fingerprint")
+		return nil, "", errors.New("managed-PKI deployment state has no root fingerprint")
 	}
 	a.bootstrapVolume = state.BootstrapVolume
 	var certificate bytes.Buffer
 	if err := a.compose(ctx, state.ServerIP, state.ServerDNS, &certificate, "--profile", "pki-tools", "run", "--rm", "-T", "ca-export"); err != nil {
-		return fmt.Errorf("exporting managed root certificate: %w", err)
+		return nil, "", fmt.Errorf("exporting managed root certificate: %w", err)
 	}
 	if certificate.Len() == 0 || certificate.Len() > maxPKIFileSize {
-		return errors.New("exported root certificate has an invalid size")
+		return nil, "", errors.New("exported root certificate has an invalid size")
 	}
 	if err := validateRootCertificate(certificate.Bytes(), state.RootFingerprint, time.Now()); err != nil {
-		return fmt.Errorf("validating exported root certificate: %w", err)
+		return nil, "", fmt.Errorf("validating exported root certificate: %w", err)
 	}
-	if err := atomicWriteFile(outputPath, certificate.Bytes(), 0o644); err != nil {
-		return err
-	}
-	fmt.Fprintf(a.stdout, "Exported managed root CA certificate: %s\nRoot fingerprint: %s\n", outputPath, state.RootFingerprint)
-	return nil
+	return certificate.Bytes(), state.RootFingerprint, nil
 }
 
 func atomicWritePrivate(path string, data []byte) error {

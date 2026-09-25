@@ -4,3 +4,4 @@
 pki/*
 !pki/README.md
 /pqnext-cbomkitctl
+hosts.txt

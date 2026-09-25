@@ -187,3 +187,68 @@ func TestInternalCommandDoesNotRequireComposeFile(t *testing.T) {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
 	}
 }
+
+func TestReinitializeCAResetsOnlyPKIVolumesAndRecordsNewIdentity(t *testing.T) {
+	dir := t.TempDir()
+	passwordFile := filepath.Join(dir, "password")
+	if err := os.WriteFile(passwordFile, []byte("new-root-passphrase"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldBootstrap := "pqnext-cbomkit-ca-root-bootstrap-0123456789abcdef"
+	if err := saveState(dir, deploymentState{PKIMode: "managed", ServerIP: "192.0.2.10", ServerDNS: "cbomkit.example", RootFingerprint: strings.Repeat("a", 64), RecoveryArchive: "/old/recovery.tar.gz", BootstrapVolume: oldBootstrap}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingRunner{}
+	a := &app{projectDir: dir, runner: runner, stdin: bytes.NewReader(nil), stdout: io.Discard, stderr: io.Discard}
+	err := a.reinitializeCA(context.Background(), []string{"--server-ip", "192.0.2.20", "--root-password-file", passwordFile, "--recovery-dir", filepath.Join(dir, "recovery"), "--yes"})
+	if err == nil || !strings.Contains(err.Error(), "validating exported root recovery archive") {
+		t.Fatalf("expected fake export to fail after reset, got %v", err)
+	}
+	state, err := loadState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ServerIP != "192.0.2.20" || state.ServerDNS != "cbomkit.example" || state.RootFingerprint != "" || state.RecoveryArchive != "" || state.BootstrapVolume == oldBootstrap || !bootstrapVolumePattern.MatchString(state.BootstrapVolume) {
+		t.Fatalf("reset state = %#v", state)
+	}
+	var removed []string
+	for _, call := range runner.calls {
+		if len(call.args) == 3 && reflect.DeepEqual(call.args[:2], []string{"volume", "rm"}) {
+			removed = append(removed, call.args[2])
+		}
+	}
+	wantRemoved := append(append([]string{}, managedVolumes...), oldBootstrap)
+	if !reflect.DeepEqual(removed, wantRemoved) {
+		t.Fatalf("removed = %v, want %v", removed, wantRemoved)
+	}
+	if len(runner.calls) < 2 || !strings.Contains(strings.Join(runner.calls[1].args, " "), "managed-pki down") {
+		t.Fatalf("deployment was not stopped before volume removal: %#v", runner.calls)
+	}
+}
+
+func TestReinitializeCARequiresTerminalOrYes(t *testing.T) {
+	runner := &recordingRunner{}
+	a := &app{projectDir: t.TempDir(), runner: runner, stdin: bytes.NewReader(nil), stdout: io.Discard, stderr: io.Discard}
+	if err := saveState(a.projectDir, deploymentState{PKIMode: "managed", ServerIP: "192.0.2.10"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.reinitializeCA(context.Background(), []string{"--server-ip", "192.0.2.20"}); err == nil || !strings.Contains(err.Error(), "--yes") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatal("Docker was called without confirmation")
+	}
+}
+
+func TestReadCAResetConfirmation(t *testing.T) {
+	var prompt bytes.Buffer
+	if err := readCAResetConfirmation(strings.NewReader("reinit-ca\n"), &prompt); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt.String(), "invalidate existing client certificates") {
+		t.Fatalf("prompt = %q", prompt.String())
+	}
+	if err := readCAResetConfirmation(strings.NewReader("no\n"), io.Discard); err == nil || !strings.Contains(err.Error(), "cancelled") {
+		t.Fatalf("unexpected response to cancellation: %v", err)
+	}
+}
