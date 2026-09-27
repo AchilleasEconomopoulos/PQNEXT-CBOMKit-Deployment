@@ -1,0 +1,63 @@
+name: Release deployment stack
+
+on:
+  push:
+    tags:
+      - "stack-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stack-v tag to package and release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Validate release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          SERVER_IP: 127.0.0.1
+        run: |
+          [[ "$RELEASE_TAG" =~ ^stack-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          go test ./...
+          go vet ./...
+          bash -n step-ca/bin/pqnext-cbomkit-pki
+          docker compose --profile managed-pki --profile pki-tools config --quiet
+
+      - name: Package deployment
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          mkdir dist
+          git archive --format=tar HEAD \
+            docker-compose.yml nginx.conf opa step-ca \
+            .env.example .dockerignore go.mod go.sum cmd internal README.md \
+            | gzip -n > "dist/pqnext-cbomkit-${RELEASE_TAG}.tar.gz"
+          cd dist
+          sha256sum pqnext-cbomkit-stack-*.tar.gz > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --generate-notes

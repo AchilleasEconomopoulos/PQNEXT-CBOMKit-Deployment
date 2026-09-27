@@ -10,13 +10,64 @@ scripts are required.
 
 - Docker Engine or Docker Desktop using Linux containers
 - Docker Compose v2 (`docker compose`)
-- locally available `pqnext-cbomkit-backend` and
-  `pqnext-cbomkit-frontend` images
-- a populated `.env`; start from `.env.example`
+- network access to the public GitHub release and container registries
+- optional configuration through environment variables or a file based on
+  `.env.example`
 
 Build the management CLI with `go build ./cmd/pqnext-cbomkitctl`, or use a
-platform binary from the release artifacts. Run it from this directory, or pass
-`--project-dir` before the command.
+platform binary from a `cli-v*` release.
+
+## Install a deployment release
+
+Download the CLI, then run:
+
+```text
+pqnext-cbomkitctl install --stack-version 1.0.0 \
+  --pki managed --server-ip 192.0.2.10 --server-dns pqnext-cbomkit.example
+```
+
+The CLI downloads `pqnext-cbomkit-stack-v1.0.0.tar.gz` and `SHA256SUMS`
+from the public `stack-v1.0.0` release, verifies the archive's SHA-256 checksum,
+and extracts it into `~/.pqnext/cbomkit/stacks/stack-v1.0.0/`. No Git checkout,
+GitHub authentication, or host Go installation is required. Versions can be
+given as `1.0.0`, `v1.0.0`, or `stack-v1.0.0`; prereleases such as `1.0.0-rc.1`
+are also accepted. There is no automatic selection of the latest release.
+
+`--env-file PATH` is optional. If omitted, Compose uses environment variables,
+an existing deployment `.env` if present, and its configured defaults. To supply
+a configuration file, create one such as `deployment.env` using `.env.example`
+as a template, and add `--env-file deployment.env` to the install command. The
+CLI copies it into the deployment's `.env` with private file permissions where
+supported. Repeating the same configuration is allowed; existing configuration
+with different contents is never overwritten. The source configuration file is
+preserved. Protect both files because they may contain credentials.
+
+The stack version and directory are recorded in the existing home-directory
+state file. Later commands and installation retries reuse that directory from
+any working directory. A retry can omit `--stack-version` and `--env-file`; a
+retry specifying the same version reuses the downloaded bundle. Switching an
+installed deployment to another stack version is not supported in this release.
+The same download flags work with `--pki external` and its certificate flags.
+
+For local development or a manually extracted deployment, run from the deployment
+directory or pass `--project-dir PATH` before the command. `--project-dir` and
+`--stack-version` cannot be combined. The examples below also work with this
+local workflow.
+
+## Release tags
+
+- `cli-v1.0.0` triggers the CLI workflow and publishes platform binaries and
+  their checksums.
+- `stack-v1.0.0` triggers the deployment workflow and publishes the stack archive
+  and its checksum. The archive includes Compose, NGINX, OPA, step-ca, the
+  configuration template, and the Go source needed to build the PKI image.
+
+Both workflows run on their respective tag pushes or through `workflow_dispatch`
+with an existing matching tag supplied as the `tag` input. The stack workflow
+packages an explicit list of tracked paths from the tagged commit; operator
+`.env` files, tokens, local state, and recovery archives are not included.
+The PKI image is still built locally by Docker during installation. Publishing
+a prebuilt PKI image and supporting stack upgrades are deferred.
 
 ## Managed PKI
 
@@ -165,17 +216,19 @@ To remove the deployment and its data, run:
 pqnext-cbomkitctl uninstall
 ```
 
-Run this from the deployment checkout or pass `--project-dir PATH`. Type
+Downloaded installations use the recorded deployment directory; local
+installations can pass `--project-dir PATH`. Type
 `uninstall` at the prompt, or pass `--yes` for unattended use. The command
 removes the Compose containers and network, all application, database, and PKI
 volumes, `~/.pqnext/cbomkit/state.json`, and the matching encrypted root
 recovery archive recorded in that state. It also works after a partial install
 with no readable state. In that case, custom recovery archives and other host
 files cannot be identified and must be removed manually. Docker images, the
-deployment checkout, `.env`, the old project-local state file, and separately
-exported certificates or tokens remain.
+deployment checkout or downloaded stack directory, `.env`, the old project-local
+state file, and separately exported certificates or tokens remain.
 
-The chosen PKI mode and server identity are recorded in
+The chosen PKI mode, server identity, deployment directory, and downloaded stack
+version (when applicable) are recorded in
 `~/.pqnext/cbomkit/state.json` for the user running the CLI. The CLI creates
 `~/.pqnext/cbomkit` with private permissions and uses platform-native paths on
 non-Unix hosts. Run subsequent commands as the same user; `sudo` may select a

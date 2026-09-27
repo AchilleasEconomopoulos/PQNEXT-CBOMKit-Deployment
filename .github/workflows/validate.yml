@@ -36,6 +36,7 @@ jobs:
           yamllint -d relaxed
           docker-compose.yml
           .github/workflows/release-cli.yml
+          .github/workflows/release-stack.yml
           .github/workflows/validate.yml
 
       - name: Test management CLI

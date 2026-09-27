@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -43,6 +44,8 @@ type app struct {
 	stderr          io.Writer
 	bootstrapVolume string
 	rootPassword    []byte
+	releaseBaseURL  string
+	httpClient      *http.Client
 }
 
 // Main is the command-line entry point. It returns a process exit code.
@@ -53,20 +56,24 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	internalCommand := len(remaining) > 0 && strings.HasPrefix(remaining[0], "internal-")
-	if projectDir == "" && internalCommand {
+	installCommand := len(remaining) > 0 && remaining[0] == "install"
+	helpCommand := len(remaining) == 0 || remaining[0] == "help"
+	if projectDir == "" && (internalCommand || helpCommand) {
 		projectDir = "."
 	}
-	if projectDir == "" {
-		projectDir, err = locateProject()
+	if projectDir == "" && !installCommand {
+		projectDir, err = resolveProject()
 		if err != nil {
 			fmt.Fprintln(stderr, "error:", err)
 			return 1
 		}
 	}
-	projectDir, err = filepath.Abs(projectDir)
-	if err != nil {
-		fmt.Fprintln(stderr, "error: resolving project directory:", err)
-		return 1
+	if projectDir != "" {
+		projectDir, err = filepath.Abs(projectDir)
+		if err != nil {
+			fmt.Fprintln(stderr, "error: resolving project directory:", err)
+			return 1
+		}
 	}
 
 	a := &app{projectDir: projectDir, runner: execRunner{}, stdin: stdin, stdout: stdout, stderr: stderr}
@@ -160,8 +167,9 @@ func (a *app) run(ctx context.Context, args []string) error {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
+  pqnext-cbomkitctl install --stack-version VERSION [--env-file PATH] --pki managed --server-ip ADDRESS [options]
   pqnext-cbomkitctl [--project-dir PATH] install --pki managed --server-ip ADDRESS [options]
-  pqnext-cbomkitctl [--project-dir PATH] install --pki external --server-ip ADDRESS --server-cert PATH --server-key PATH --client-ca PATH
+  pqnext-cbomkitctl [--project-dir PATH] install --pki external --server-ip ADDRESS --server-cert PATH --server-key PATH --client-ca PATH [--stack-version VERSION --env-file PATH]
   pqnext-cbomkitctl [--project-dir PATH] up|down|status
   pqnext-cbomkitctl [--project-dir PATH] uninstall [--yes]
   pqnext-cbomkitctl [--project-dir PATH] pki import --server-cert PATH --server-key PATH --client-ca PATH
@@ -171,8 +179,10 @@ func printUsage(w io.Writer) {
   pqnext-cbomkitctl [--project-dir PATH] client-token --name NAME [--output PATH]
 
 Uninstall removes the deployment's containers, network, data and PKI volumes,
-home-directory state, and its verified recorded recovery archive. Run it from
-the deployment checkout or provide --project-dir PATH.`)
+home-directory state, and its verified recorded recovery archive.
+Downloaded installations use their recorded stack directory for later commands.
+Local installations can use --project-dir PATH. --stack-version and
+--project-dir cannot be combined; changing an installed stack version is not supported.`)
 }
 
 type installOptions struct {
@@ -184,6 +194,8 @@ type installOptions struct {
 	serverCert       string
 	serverKey        string
 	clientCA         string
+	stackVersion     string
+	envFile          string
 }
 
 func (a *app) install(ctx context.Context, args []string) error {
@@ -198,6 +210,8 @@ func (a *app) install(ctx context.Context, args []string) error {
 	fs.StringVar(&options.serverCert, "server-cert", "", "external server certificate chain")
 	fs.StringVar(&options.serverKey, "server-key", "", "external unencrypted server private key")
 	fs.StringVar(&options.clientCA, "client-ca", "", "external client CA trust bundle")
+	fs.StringVar(&options.stackVersion, "stack-version", "", "public deployment release version (e.g. 1.0.0 or stack-v1.0.0)")
+	fs.StringVar(&options.envFile, "env-file", "", "configuration file to copy to the deployment's .env without replacing existing settings")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -217,6 +231,9 @@ func (a *app) install(ctx context.Context, args []string) error {
 	if state != nil && (state.ServerIP != options.serverIP || state.ServerDNS != options.serverDNS) {
 		return errors.New("server identity differs from the recorded deployment state; certificate identity migration is not implemented")
 	}
+	if err := a.prepareInstallProject(ctx, options, state); err != nil {
+		return err
+	}
 	newState := state == nil
 	if state == nil {
 		if err := refuseLegacyPKI(a.projectDir); err != nil {
@@ -229,6 +246,10 @@ func (a *app) install(ctx context.Context, args []string) error {
 				return err
 			}
 		}
+	}
+	state.ProjectDir = a.projectDir
+	if options.stackVersion != "" {
+		state.StackVersion, _ = normalizeStackVersion(options.stackVersion)
 	}
 	a.bootstrapVolume = state.BootstrapVolume
 	if err := a.checkDocker(ctx); err != nil {

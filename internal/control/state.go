@@ -19,6 +19,8 @@ type deploymentState struct {
 	RootFingerprint string `json:"rootFingerprint,omitempty"`
 	RecoveryArchive string `json:"recoveryArchive,omitempty"`
 	BootstrapVolume string `json:"bootstrapVolume,omitempty"`
+	ProjectDir      string `json:"projectDir,omitempty"`
+	StackVersion    string `json:"stackVersion,omitempty"`
 }
 
 func statePath() (string, error) {
