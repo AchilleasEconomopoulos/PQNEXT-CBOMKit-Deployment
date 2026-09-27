@@ -17,6 +17,10 @@ scripts are required.
 Build the management CLI with `go build ./cmd/pqnext-cbomkitctl`, or use a
 platform binary from a `cli-v*` release.
 
+Global and command help (`--help` or `-h`) work without a deployment directory,
+installation state, or Docker. Deployment files are located only when a command
+needs to operate on the stack.
+
 ## Install a deployment release
 
 Download the CLI, then run:

@@ -200,6 +200,69 @@ func TestInternalCommandDoesNotRequireComposeFile(t *testing.T) {
 	}
 }
 
+func TestHelpDoesNotRequireDeploymentOrDocker(t *testing.T) {
+	setTestStateHome(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	commands := [][]string{
+		{}, {"help"}, {"install"}, {"up"}, {"down"}, {"status"}, {"uninstall"},
+		{"client-token"}, {"pki"}, {"pki", "import"}, {"pki", "export-ca"},
+		{"pki", "distribute-ca"}, {"pki", "reinit-ca"},
+	}
+	for _, command := range commands {
+		for _, helpFlag := range []string{"--help", "-h"} {
+			args := append(append([]string{}, command...), helpFlag)
+			t.Run(strings.Join(args, " "), func(t *testing.T) {
+				var stdout, stderr bytes.Buffer
+				code := Main(args, bytes.NewReader(nil), &stdout, &stderr)
+				output := stdout.String() + stderr.String()
+				if code != 0 || !strings.Contains(output, "Usage") || strings.Contains(output, "error:") {
+					t.Fatalf("code=%d output=%q", code, output)
+				}
+			})
+		}
+	}
+}
+
+func TestCommandErrorsAreReportedBeforeDeploymentLookup(t *testing.T) {
+	setTestStateHome(t)
+	t.Chdir(t.TempDir())
+	for _, test := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"unknown"}, "unknown command"},
+		{[]string{"pki", "unknown"}, "unknown pki command"},
+		{[]string{"status"}, "deployment is not installed"},
+		{[]string{"up"}, "deployment is not installed"},
+		{[]string{"down"}, "deployment is not installed"},
+		{[]string{"install", "--unknown"}, "flag provided but not defined"},
+	} {
+		var stderr bytes.Buffer
+		code := Main(test.args, bytes.NewReader(nil), io.Discard, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), test.want) || strings.Contains(stderr.String(), "cannot locate docker-compose.yml") {
+			t.Fatalf("args=%v code=%d stderr=%q", test.args, code, stderr.String())
+		}
+	}
+}
+
+func TestLifecycleCommandResolvesRecordedDeploymentAfterParsing(t *testing.T) {
+	setTestStateHome(t)
+	t.Chdir(t.TempDir())
+	dir := t.TempDir()
+	if err := saveState(deploymentState{PKIMode: "managed", ServerIP: "192.0.2.10", ProjectDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingRunner{}
+	a := &app{runner: runner, stdout: io.Discard, stderr: io.Discard}
+	if err := a.status(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 1 || runner.calls[0].dir != dir || !containsArg(runner.calls[0].args, "ps") {
+		t.Fatalf("status did not use recorded deployment: %#v", runner.calls)
+	}
+}
+
 func TestReinitializeCAResetsOnlyPKIVolumesAndRecordsNewIdentity(t *testing.T) {
 	setTestStateHome(t)
 	dir := t.TempDir()

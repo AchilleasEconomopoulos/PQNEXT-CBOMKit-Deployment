@@ -55,29 +55,11 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error:", err)
 		return 2
 	}
-	internalCommand := len(remaining) > 0 && strings.HasPrefix(remaining[0], "internal-")
-	installCommand := len(remaining) > 0 && remaining[0] == "install"
-	helpCommand := len(remaining) == 0 || remaining[0] == "help"
-	if projectDir == "" && (internalCommand || helpCommand) {
-		projectDir = "."
-	}
-	if projectDir == "" && !installCommand {
-		projectDir, err = resolveProject()
-		if err != nil {
-			fmt.Fprintln(stderr, "error:", err)
-			return 1
-		}
-	}
-	if projectDir != "" {
-		projectDir, err = filepath.Abs(projectDir)
-		if err != nil {
-			fmt.Fprintln(stderr, "error: resolving project directory:", err)
-			return 1
-		}
-	}
-
 	a := &app{projectDir: projectDir, runner: execRunner{}, stdin: stdin, stdout: stdout, stderr: stderr}
 	if err := a.run(context.Background(), remaining); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
@@ -118,6 +100,24 @@ func locateProject() (string, error) {
 	return "", errors.New("cannot locate docker-compose.yml; run from the deployment directory or pass --project-dir")
 }
 
+// Resolve deployment files only after command flags and state have been checked.
+// Help, internal PKI commands, and argument errors do not need a deployment.
+func (a *app) ensureProjectDir() error {
+	if a.projectDir == "" {
+		dir, err := resolveProject()
+		if err != nil {
+			return err
+		}
+		a.projectDir = dir
+	}
+	dir, err := filepath.Abs(a.projectDir)
+	if err != nil {
+		return fmt.Errorf("resolving deployment directory: %w", err)
+	}
+	a.projectDir = dir
+	return nil
+}
+
 func (a *app) run(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] == "help" {
 		printUsage(a.stdout)
@@ -135,6 +135,10 @@ func (a *app) run(ctx context.Context, args []string) error {
 	case "status":
 		return a.status(ctx, args[1:])
 	case "pki":
+		if len(args) == 2 && (args[1] == "--help" || args[1] == "-h" || args[1] == "help") {
+			printUsage(a.stdout)
+			return nil
+		}
 		if len(args) < 2 {
 			return errors.New("usage: pqnext-cbomkitctl pki import ... | pki export-ca --output PATH | pki distribute-ca --hosts PATH | pki reinit-ca --server-ip ADDRESS [--yes]")
 		}
@@ -544,6 +548,9 @@ func refuseLegacyPKI(projectDir string) error {
 }
 
 func (a *app) checkDocker(ctx context.Context) error {
+	if err := a.ensureProjectDir(); err != nil {
+		return err
+	}
 	var output bytes.Buffer
 	if err := a.runner.Run(ctx, a.projectDir, nil, nil, &output, a.stderr, "docker", "compose", "version"); err != nil {
 		return errors.New("Docker Compose v2 is required")
@@ -615,6 +622,9 @@ func (a *app) composeEnvironment(serverIP, serverDNS string) map[string]string {
 }
 
 func (a *app) compose(ctx context.Context, serverIP, serverDNS string, stdout io.Writer, args ...string) error {
+	if err := a.ensureProjectDir(); err != nil {
+		return err
+	}
 	if stdout == nil {
 		stdout = a.stdout
 	}
@@ -624,6 +634,9 @@ func (a *app) compose(ctx context.Context, serverIP, serverDNS string, stdout io
 }
 
 func (a *app) composeInput(ctx context.Context, serverIP, serverDNS string, stdin io.Reader, args ...string) error {
+	if err := a.ensureProjectDir(); err != nil {
+		return err
+	}
 	base := []string{"compose", "--project-name", composeProject, "--file", composeFile}
 	base = append(base, args...)
 	return a.runner.Run(ctx, a.projectDir, a.composeEnvironment(serverIP, serverDNS), stdin, a.stdout, a.stderr, "docker", base...)
@@ -807,9 +820,24 @@ func (a *app) reloadNginxIfRunning(ctx context.Context, serverIP, serverDNS stri
 	return nil
 }
 
+func (a *app) parseLifecycleArgs(name string, args []string) error {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(a.stderr)
+	fs.Usage = func() {
+		fmt.Fprintf(a.stderr, "Usage: pqnext-cbomkitctl [--project-dir PATH] %s\n", name)
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("%s accepts no arguments", name)
+	}
+	return nil
+}
+
 func (a *app) up(ctx context.Context, args []string) error {
-	if len(args) != 0 {
-		return errors.New("up accepts no arguments")
+	if err := a.parseLifecycleArgs("up", args); err != nil {
+		return err
 	}
 	state, err := loadState()
 	if err != nil {
@@ -827,8 +855,8 @@ func (a *app) up(ctx context.Context, args []string) error {
 }
 
 func (a *app) down(ctx context.Context, args []string) error {
-	if len(args) != 0 {
-		return errors.New("down accepts no arguments")
+	if err := a.parseLifecycleArgs("down", args); err != nil {
+		return err
 	}
 	state, err := loadState()
 	if err != nil {
@@ -846,8 +874,8 @@ func (a *app) down(ctx context.Context, args []string) error {
 }
 
 func (a *app) status(ctx context.Context, args []string) error {
-	if len(args) != 0 {
-		return errors.New("status accepts no arguments")
+	if err := a.parseLifecycleArgs("status", args); err != nil {
+		return err
 	}
 	state, err := loadState()
 	if err != nil {
